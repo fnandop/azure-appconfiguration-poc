@@ -1,0 +1,107 @@
+name: Deploy Azure App Configuration PoC
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    env:
+      APP_ENVIRONMENT: ${{ inputs.environment }}
+      AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      RESOURCE_PREFIX: ${{ vars.RESOURCE_PREFIX }}
+      APP_CONFIG_NAME: ${{ vars.APP_CONFIG_NAME }}
+      KEY_VAULT_NAME: ${{ vars.KEY_VAULT_NAME }}
+      Azure__SubscriptionId: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      Azure__Location: ${{ vars.AZURE_LOCATION }}
+      Azure__ResourceGroup: ${{ vars.AZURE_RESOURCE_GROUP }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install Aspire CLI
+        run: dotnet tool update -g Aspire.Cli --prerelease
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure resource group exists
+        run: |
+          az group create \
+            --name "${AZURE_RESOURCE_GROUP}" \
+            --location "${AZURE_LOCATION}"
+      
+      - name: Register required Azure providers
+        run: |
+          az provider register -n Microsoft.App --wait
+          az provider register -n Microsoft.OperationalInsights --wait
+          az provider register -n Microsoft.ContainerRegistry --wait
+          
+      - name: Restore .NET projects
+        run: dotnet restore AspireApp/AspireApp.sln
+
+      - name: Deploy with Aspire
+        run: |
+          aspire deploy \
+            --project AspireApp/AspireApp.AppHost/AspireApp.AppHost.csproj \
+            --environment "${APP_ENVIRONMENT}" \
+            --non-interactive
+
+      - name: Resolve deployed API URLs
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dotnet_api_url="$(az containerapp list \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query "[?contains(name, 'dotnet-api')].properties.configuration.ingress.fqdn | [0]" \
+            --output tsv)"
+
+          spring_api_url="$(az containerapp list \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query "[?contains(name, 'spring-api')].properties.configuration.ingress.fqdn | [0]" \
+            --output tsv)"
+
+          node_api_url="$(az containerapp list \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query "[?contains(name, 'node-api')].properties.configuration.ingress.fqdn | [0]" \
+            --output tsv)"
+
+          echo "dotnet_api_url=https://${dotnet_api_url}" >> "${GITHUB_OUTPUT}"
+          echo "spring_api_url=https://${spring_api_url}" >> "${GITHUB_OUTPUT}"
+          echo "node_api_url=https://${node_api_url}" >> "${GITHUB_OUTPUT}"
+
+      - name: Smoke test deployed APIs
+        env:
+          DOTNET_API_URL: ${{ steps.resolve.outputs.dotnet_api_url }}
+          SPRING_API_URL: ${{ steps.resolve.outputs.spring_api_url }}
+          NODE_API_URL: ${{ steps.resolve.outputs.node_api_url }}
+          SMOKE_TEST_MODE: health
+        run: bash scripts/smoke-tests.sh

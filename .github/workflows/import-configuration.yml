@@ -1,0 +1,131 @@
+name: Import Configuration
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  import-configuration:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    env:
+      APP_ENVIRONMENT: ${{ inputs.environment }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      RESOURCE_PREFIX: ${{ vars.RESOURCE_PREFIX }}
+      APP_CONFIG_NAME: ${{ vars.APP_CONFIG_NAME }}
+      KEY_VAULT_NAME: ${{ vars.KEY_VAULT_NAME }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve configuration resource names
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${APP_CONFIG_NAME:-}" ]]; then
+            app_config_name="${APP_CONFIG_NAME}"
+          elif [[ -n "${RESOURCE_PREFIX:-}" ]]; then
+            app_config_name="${RESOURCE_PREFIX}-appconfig"
+          else
+            app_config_name="appconfiguration-poc-${APP_ENVIRONMENT}"
+          fi
+
+          if [[ -n "${KEY_VAULT_NAME:-}" ]]; then
+            key_vault_name="${KEY_VAULT_NAME}"
+          elif [[ -n "${RESOURCE_PREFIX:-}" ]]; then
+            key_vault_name="${RESOURCE_PREFIX}-keyvault"
+          else
+            key_vault_name="keyvault-poc-${APP_ENVIRONMENT}"
+          fi
+
+          app_config_name="$(az appconfig show \
+            --name "${app_config_name}" \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query name \
+            --output tsv)"
+
+          key_vault_name="$(az keyvault show \
+            --name "${key_vault_name}" \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query name \
+            --output tsv)"
+
+          if [[ -z "${app_config_name}" ]]; then
+            echo "Failed to resolve Azure App Configuration name." >&2
+            exit 1
+          fi
+
+          if [[ -z "${key_vault_name}" ]]; then
+            echo "Failed to resolve Key Vault name." >&2
+            exit 1
+          fi
+
+          echo "app_config_name=${app_config_name}" >> "${GITHUB_OUTPUT}"
+          echo "key_vault_name=${key_vault_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set Key Vault secrets
+        env:
+          KEY_VAULT_NAME: ${{ steps.resolve.outputs.key_vault_name }}
+          EXTERNAL_API_KEY: ${{ secrets.EXTERNAL_API_KEY }}
+        run: bash scripts/set-keyvault-secrets.sh
+
+      - name: Import Azure App Configuration values
+        env:
+          APP_CONFIG_NAME: ${{ steps.resolve.outputs.app_config_name }}
+          ENVIRONMENT_NAME: ${{ inputs.environment }}
+        run: bash scripts/import-appconfig.sh
+
+      - name: Resolve deployed API URLs
+        id: api-urls
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dotnet_api_url="$(az containerapp list \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query "[?contains(name, 'dotnet-api')].properties.configuration.ingress.fqdn | [0]" \
+            --output tsv)"
+
+          spring_api_url="$(az containerapp list \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query "[?contains(name, 'spring-api')].properties.configuration.ingress.fqdn | [0]" \
+            --output tsv)"
+
+          node_api_url="$(az containerapp list \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query "[?contains(name, 'node-api')].properties.configuration.ingress.fqdn | [0]" \
+            --output tsv)"
+
+          echo "dotnet_api_url=https://${dotnet_api_url}" >> "${GITHUB_OUTPUT}"
+          echo "spring_api_url=https://${spring_api_url}" >> "${GITHUB_OUTPUT}"
+          echo "node_api_url=https://${node_api_url}" >> "${GITHUB_OUTPUT}"
+
+      - name: Smoke test configured APIs
+        env:
+          DOTNET_API_URL: ${{ steps.api-urls.outputs.dotnet_api_url }}
+          SPRING_API_URL: ${{ steps.api-urls.outputs.spring_api_url }}
+          NODE_API_URL: ${{ steps.api-urls.outputs.node_api_url }}
+        run: bash scripts/smoke-tests.sh

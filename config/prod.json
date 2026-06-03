@@ -1,0 +1,6 @@
+{
+  "DemoApp:Environment": "prod",
+  "DemoApp:Message": "Hello from PROD Azure App Configuration",
+  "DemoApp:ExternalApi:ApiKey": "",
+  "FeatureManagement:BetaGreeting": true
+}

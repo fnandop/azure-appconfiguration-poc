@@ -1,0 +1,4 @@
+{
+  "DemoApp:ApplicationName": "Azure App Configuration PoC",
+  "DemoApp:ExternalApi:BaseUrl": "https://example.com"
+}
